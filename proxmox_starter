@@ -1,0 +1,937 @@
+#!/bin/bash
+# ==============================================================================
+# proxmox-setup.sh - Proxmox VE Post-Install Configuration Tool
+# ==============================================================================
+# Version History:
+#   v1 - 2025-02-23 - Initial version: VLAN trunk setup with backup/restore
+#   v2 - 2025-02-23 - Added enterprise repo disable, syslog/Graylog config,
+#                      Tailscale install, unified menu system, run-all option
+# ==============================================================================
+# Description:
+#   One-stop post-install configuration for Proxmox VE 8.3+ hosts.
+#
+#   Menu options:
+#     1) VLAN Trunk   - Enable VLAN awareness on bridge interface
+#     2) Repositories - Disable enterprise repos, enable no-subscription repos
+#     3) Syslog       - Configure rsyslog forwarding to Graylog/syslog collector
+#     4) Tailscale    - Install Tailscale VPN client
+#     5) Run All      - Execute options 1-4 sequentially
+#     R) Restore      - Restore network config from backup
+#     S) Status       - Show current configuration status
+#
+# Usage:
+#   ./proxmox-setup.sh              # Interactive menu
+#   ./proxmox-setup.sh --help       # Show help
+# ==============================================================================
+
+set -euo pipefail
+
+readonly SCRIPT_VERSION="v2"
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly INTERFACES_FILE="/etc/network/interfaces"
+readonly BACKUP_DIR="/etc/network/backups"
+readonly RSYSLOG_CONF="/etc/rsyslog.d/10-graylog.conf"
+readonly MIN_PVE_MAJOR=8
+readonly MIN_PVE_MINOR=3
+
+# Enterprise repo files
+readonly PVE_ENTERPRISE_LIST="/etc/apt/sources.list.d/pve-enterprise.list"
+readonly CEPH_ENTERPRISE_LIST="/etc/apt/sources.list.d/ceph.list"
+readonly PVE_NO_SUB_LIST="/etc/apt/sources.list.d/pve-no-subscription.list"
+readonly CEPH_NO_SUB_LIST="/etc/apt/sources.list.d/ceph-no-subscription.list"
+
+# Colors
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly DIM='\033[2m'
+readonly NC='\033[0m'
+
+# Track what was done for summary
+declare -A RESULTS=()
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  Helper Functions                                                         ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+log_info()    { echo -e "  ${GREEN}✓${NC} $*"; }
+log_warn()    { echo -e "  ${YELLOW}⚠${NC} $*"; }
+log_error()   { echo -e "  ${RED}✗${NC} $*"; }
+log_step()    { echo -e "  ${CYAN}→${NC} $*"; }
+log_header()  { echo -e "\n${BOLD}${CYAN}━━━ $* ━━━${NC}\n"; }
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+check_root() {
+    [[ $EUID -eq 0 ]] || die "This script must be run as root. Use: sudo $SCRIPT_NAME"
+}
+
+check_proxmox_version() {
+    if ! command -v pveversion &>/dev/null; then
+        die "pveversion not found. Is this a Proxmox VE host?"
+    fi
+
+    local pve_full
+    pve_full="$(pveversion | grep -oP 'pve-manager/\K[0-9]+\.[0-9]+' || true)"
+
+    if [[ -z "$pve_full" ]]; then
+        log_warn "Could not parse Proxmox version. Proceeding anyway."
+        return
+    fi
+
+    local major minor
+    major="${pve_full%%.*}"
+    minor="${pve_full#*.}"
+
+    if (( major < MIN_PVE_MAJOR )) || { (( major == MIN_PVE_MAJOR )) && (( minor < MIN_PVE_MINOR )); }; then
+        die "Proxmox VE ${major}.${minor} detected. Requires ${MIN_PVE_MAJOR}.${MIN_PVE_MINOR}+."
+    fi
+
+    log_info "Proxmox VE ${major}.${minor} detected"
+}
+
+press_enter() {
+    echo
+    read -rp "  Press Enter to continue..." _
+}
+
+confirm_action() {
+    local prompt="${1:-Proceed?}"
+    local reply
+    read -rp "  ${prompt} [y/N]: " reply
+    [[ "${reply,,}" == "y" ]]
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  1. VLAN Trunk Configuration                                             ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+get_physical_interfaces() {
+    local ifaces=()
+    for iface_path in /sys/class/net/*/; do
+        local iface
+        iface="$(basename "$iface_path")"
+        [[ "$iface" == "lo" ]] && continue
+        [[ "$iface" == vmbr* ]] && continue
+        [[ "$iface" == tap* ]] && continue
+        [[ "$iface" == veth* ]] && continue
+        [[ "$iface" == bond* ]] && continue
+        [[ "$iface" == dummy* ]] && continue
+        [[ "$iface" == tailscale* ]] && continue
+        [[ "$iface" == *.* ]] && continue
+        [[ -e "/sys/class/net/${iface}/device" ]] || continue
+        ifaces+=("$iface")
+    done
+    printf '%s\n' "${ifaces[@]}" | sort -V
+}
+
+get_interface_status() { cat "/sys/class/net/${1}/operstate" 2>/dev/null || echo "unknown"; }
+
+get_interface_speed() {
+    local speed
+    speed="$(cat "/sys/class/net/${1}/speed" 2>/dev/null || echo "-1")"
+    [[ "$speed" == "-1" ]] && echo "N/A" || echo "${speed}Mb/s"
+}
+
+get_interface_mac() { cat "/sys/class/net/${1}/address" 2>/dev/null || echo "N/A"; }
+
+get_bridge_for_interface() {
+    local iface="$1" current_block=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^iface[[:space:]]+(vmbr[0-9]+) ]]; then
+            current_block="${BASH_REMATCH[1]}"
+        elif [[ -n "$current_block" && "$line" =~ bridge-ports.*[[:space:]]${iface}([[:space:]]|$) ]]; then
+            echo "$current_block"
+            return 0
+        elif [[ "$line" =~ ^(auto|iface|source)[[:space:]] && ! "$line" =~ ^iface[[:space:]]+${current_block:-NOMATCH} ]]; then
+            if [[ "$line" =~ ^iface[[:space:]]+(vmbr[0-9]+) ]]; then
+                current_block="${BASH_REMATCH[1]}"
+            else
+                current_block=""
+            fi
+        fi
+    done < "$INTERFACES_FILE"
+    echo ""
+}
+
+is_vlan_aware() {
+    local bridge="$1" in_block=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^iface[[:space:]]+${bridge}[[:space:]] ]]; then
+            in_block=1; continue
+        fi
+        if (( in_block )) && [[ "$line" =~ ^(auto|iface|source)[[:space:]] ]]; then
+            break
+        fi
+        if (( in_block )) && [[ "$line" =~ bridge-vlan-aware[[:space:]]+yes ]]; then
+            return 0
+        fi
+    done < "$INTERFACES_FILE"
+    return 1
+}
+
+create_network_backup() {
+    mkdir -p "$BACKUP_DIR"
+    local timestamp backup_file
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    backup_file="${BACKUP_DIR}/interfaces.backup.${timestamp}"
+    cp -a "$INTERFACES_FILE" "$backup_file"
+    log_info "Backup: ${backup_file}"
+    echo "$backup_file"
+}
+
+enable_vlan_on_bridge() {
+    local bridge="$1" vids="${2:-2-4094}"
+    local tmpfile in_block=0 last_bridge_line=0 line_num=0
+    local already_vlan_aware=0 already_has_vids=0
+
+    tmpfile="$(mktemp)"
+    trap 'rm -f "$tmpfile"' RETURN
+
+    # Analyze bridge block
+    while IFS= read -r line; do
+        ((line_num++))
+        if [[ "$line" =~ ^iface[[:space:]]+${bridge}[[:space:]] ]]; then
+            in_block=1; continue
+        fi
+        if (( in_block )); then
+            if [[ "$line" =~ ^(auto|iface|source)[[:space:]] ]]; then break; fi
+            [[ "$line" =~ bridge-vlan-aware ]] && already_vlan_aware=1
+            [[ "$line" =~ bridge-vids ]] && already_has_vids=1
+            [[ "$line" =~ ^[[:space:]]*bridge- ]] && last_bridge_line=$line_num
+        fi
+    done < "$INTERFACES_FILE"
+
+    if (( in_block && last_bridge_line == 0 )); then
+        last_bridge_line=$line_num
+    fi
+
+    if (( already_vlan_aware && already_has_vids )); then
+        log_info "Bridge ${bridge} already VLAN-aware with VIDs."
+        return 0
+    fi
+
+    # Write modified config
+    in_block=0; line_num=0
+    local added_vlan=0 added_vids=0
+
+    while IFS= read -r line; do
+        ((line_num++))
+        if [[ "$line" =~ ^iface[[:space:]]+${bridge}[[:space:]] ]]; then
+            in_block=1
+            echo "$line" >> "$tmpfile"
+            continue
+        fi
+        if (( in_block )); then
+            [[ "$line" =~ bridge-vlan-aware ]] && { echo "        bridge-vlan-aware yes" >> "$tmpfile"; added_vlan=1; continue; }
+            [[ "$line" =~ bridge-vids ]] && { echo "        bridge-vids ${vids}" >> "$tmpfile"; added_vids=1; continue; }
+            if (( line_num == last_bridge_line )); then
+                echo "$line" >> "$tmpfile"
+                (( !already_vlan_aware && !added_vlan )) && { echo "        bridge-vlan-aware yes" >> "$tmpfile"; added_vlan=1; }
+                (( !already_has_vids && !added_vids )) && { echo "        bridge-vids ${vids}" >> "$tmpfile"; added_vids=1; }
+                continue
+            fi
+            [[ "$line" =~ ^(auto|iface|source)[[:space:]] ]] && in_block=0
+        fi
+        echo "$line" >> "$tmpfile"
+    done < "$INTERFACES_FILE"
+
+    (( in_block && !added_vlan && !already_vlan_aware )) && echo "        bridge-vlan-aware yes" >> "$tmpfile"
+    (( in_block && !added_vids && !already_has_vids )) && echo "        bridge-vids ${vids}" >> "$tmpfile"
+
+    cp "$tmpfile" "$INTERFACES_FILE"
+}
+
+do_vlan_setup() {
+    log_header "1. VLAN Trunk Configuration"
+
+    if [[ ! -f "$INTERFACES_FILE" ]]; then
+        die "Network interfaces file not found: ${INTERFACES_FILE}"
+    fi
+
+    local ifaces_list=()
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] && ifaces_list+=("$iface")
+    done < <(get_physical_interfaces)
+
+    if [[ ${#ifaces_list[@]} -eq 0 ]]; then
+        log_error "No physical network interfaces detected."
+        RESULTS[vlan]="FAILED - no interfaces"
+        return 1
+    fi
+
+    echo -e "  ${BOLD}Detected interfaces:${NC}\n"
+    local i=1 first_online=""
+    for iface in "${ifaces_list[@]}"; do
+        local status speed mac bridge status_color marker=""
+        status="$(get_interface_status "$iface")"
+        speed="$(get_interface_speed "$iface")"
+        mac="$(get_interface_mac "$iface")"
+        bridge="$(get_bridge_for_interface "$iface")"
+
+        if [[ "$status" == "up" ]]; then
+            status_color="${GREEN}UP${NC}"
+            [[ -z "$first_online" ]] && first_online=$i && marker=" ${YELLOW}◀ default${NC}"
+        else
+            status_color="${RED}${status}${NC}"
+        fi
+
+        local bridge_info=""
+        [[ -n "$bridge" ]] && bridge_info=" → ${CYAN}${bridge}${NC}"
+
+        printf "    ${CYAN}%d)${NC} %-10s [%b] %-12s %s%b%b\n" \
+            "$i" "$iface" "$status_color" "$speed" "$mac" "$bridge_info" "$marker"
+        ((i++))
+    done
+    echo
+
+    local default="${first_online:-1}" choice
+    read -rp "  Select interface [${default}]: " choice
+    choice="${choice:-$default}"
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 )) || (( choice > ${#ifaces_list[@]} )); then
+        log_error "Invalid selection: ${choice}"
+        RESULTS[vlan]="FAILED - invalid selection"
+        return 1
+    fi
+
+    local selected_iface="${ifaces_list[$((choice - 1))]}"
+    local bridge
+    bridge="$(get_bridge_for_interface "$selected_iface")"
+
+    if [[ -z "$bridge" ]]; then
+        log_error "Interface ${selected_iface} not assigned to any bridge."
+        log_warn "Configure the bridge first via Proxmox GUI, then re-run."
+        RESULTS[vlan]="FAILED - no bridge"
+        return 1
+    fi
+
+    if is_vlan_aware "$bridge"; then
+        log_info "Bridge ${bridge} already VLAN-aware. No changes needed."
+        RESULTS[vlan]="OK (already configured)"
+        return 0
+    fi
+
+    local vids
+    read -rp "  VLAN ID range [2-4094]: " vids
+    vids="${vids:-2-4094}"
+
+    echo
+    log_step "Bridge: ${BOLD}${bridge}${NC} via ${BOLD}${selected_iface}${NC}"
+    log_step "Adding: bridge-vlan-aware yes"
+    log_step "Adding: bridge-vids ${vids}"
+    echo
+
+    if ! confirm_action "Apply VLAN changes?"; then
+        log_warn "VLAN setup skipped."
+        RESULTS[vlan]="SKIPPED"
+        return 0
+    fi
+
+    local backup_file
+    backup_file="$(create_network_backup)"
+    enable_vlan_on_bridge "$bridge" "$vids"
+
+    echo
+    echo -e "  ${DIM}--- diff ---${NC}"
+    diff --color=auto "$backup_file" "$INTERFACES_FILE" 2>/dev/null | sed 's/^/  /' || true
+    echo -e "  ${DIM}--- end ---${NC}"
+    echo
+
+    if confirm_action "Apply now with 'ifreload -a'?"; then
+        if command -v ifreload &>/dev/null; then
+            ifreload -a
+            log_info "Network config applied."
+        else
+            log_warn "'ifreload' not found. Reboot to apply."
+        fi
+    else
+        log_info "Saved but NOT applied. Run 'ifreload -a' or reboot."
+    fi
+
+    RESULTS[vlan]="OK - ${bridge} (${selected_iface})"
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  2. Enterprise Repository Disable                                        ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+do_repo_setup() {
+    log_header "2. Disable Enterprise Repos / Enable No-Subscription"
+
+    local changes_made=0
+
+    # --- Disable PVE enterprise repo ---
+    if [[ -f "$PVE_ENTERPRISE_LIST" ]]; then
+        if grep -q "^deb " "$PVE_ENTERPRISE_LIST" 2>/dev/null; then
+            log_step "Commenting out PVE enterprise repo..."
+            cp "$PVE_ENTERPRISE_LIST" "${PVE_ENTERPRISE_LIST}.bak.$(date +%Y%m%d_%H%M%S)"
+            sed -i 's/^deb /# deb /' "$PVE_ENTERPRISE_LIST"
+            log_info "PVE enterprise repo disabled."
+            changes_made=1
+        else
+            log_info "PVE enterprise repo already disabled."
+        fi
+    else
+        log_info "PVE enterprise repo file not found (already clean)."
+    fi
+
+    # --- Disable Ceph enterprise repo ---
+    if [[ -f "$CEPH_ENTERPRISE_LIST" ]]; then
+        if grep -q "^deb " "$CEPH_ENTERPRISE_LIST" 2>/dev/null; then
+            log_step "Commenting out Ceph enterprise repo..."
+            cp "$CEPH_ENTERPRISE_LIST" "${CEPH_ENTERPRISE_LIST}.bak.$(date +%Y%m%d_%H%M%S)"
+            sed -i 's/^deb /# deb /' "$CEPH_ENTERPRISE_LIST"
+            log_info "Ceph enterprise repo disabled."
+            changes_made=1
+        else
+            log_info "Ceph enterprise repo already disabled."
+        fi
+    else
+        log_info "Ceph enterprise repo file not found (already clean)."
+    fi
+
+    # --- Enable PVE no-subscription repo ---
+    local pve_codename
+    pve_codename="$(grep -oP 'VERSION_CODENAME=\K\w+' /etc/os-release 2>/dev/null || echo "bookworm")"
+
+    if [[ -f "$PVE_NO_SUB_LIST" ]] && grep -q "^deb .*pve-no-subscription" "$PVE_NO_SUB_LIST" 2>/dev/null; then
+        log_info "PVE no-subscription repo already enabled."
+    else
+        log_step "Adding PVE no-subscription repo (${pve_codename})..."
+        echo "deb http://download.proxmox.com/debian/pve ${pve_codename} pve-no-subscription" > "$PVE_NO_SUB_LIST"
+        log_info "PVE no-subscription repo enabled."
+        changes_made=1
+    fi
+
+    # --- Enable Ceph no-subscription repo ---
+    # Detect Ceph version from existing enterprise repo or default to reef
+    local ceph_release="reef"
+    if [[ -f "$CEPH_ENTERPRISE_LIST" ]]; then
+        local detected
+        detected="$(grep -oP 'debian-ceph-\K\w+' "$CEPH_ENTERPRISE_LIST" 2>/dev/null | head -1 || true)"
+        [[ -n "$detected" ]] && ceph_release="$detected"
+    fi
+
+    if [[ -f "$CEPH_NO_SUB_LIST" ]] && grep -q "^deb .*no-subscription" "$CEPH_NO_SUB_LIST" 2>/dev/null; then
+        log_info "Ceph no-subscription repo already enabled."
+    else
+        log_step "Adding Ceph no-subscription repo (${ceph_release})..."
+        echo "deb http://download.proxmox.com/debian/ceph-${ceph_release} ${pve_codename} no-subscription" > "$CEPH_NO_SUB_LIST"
+        log_info "Ceph no-subscription repo enabled."
+        changes_made=1
+    fi
+
+    # --- Remove subscription nag (optional) ---
+    echo
+    local nag_file="/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js"
+    if [[ -f "$nag_file" ]]; then
+        if grep -q "No valid subscription" "$nag_file" 2>/dev/null && \
+           ! grep -q "// SUBSCRIPTION NAG DISABLED" "$nag_file" 2>/dev/null; then
+            if confirm_action "Also remove the 'No valid subscription' login popup?"; then
+                cp "$nag_file" "${nag_file}.bak.$(date +%Y%m%d_%H%M%S)"
+                # Replace the subscription check with void function
+                sed -i.tmp "s/Ext.Msg.show({/void({ \/\/ SUBSCRIPTION NAG DISABLED\n            Ext.Msg.show({/;s/if (res === null || res === undefined || \!res || res/if (false \&\& res/" "$nag_file" 2>/dev/null || {
+                    # Simpler approach - just comment the check
+                    cp "${nag_file}.bak."* "$nag_file" 2>/dev/null
+                    sed -i "/data.status.toLowerCase() !== 'active'/,/void({/{ s/Ext.Msg.show/void(\{\/\/DISABLED\n\/\/Ext.Msg.show/; }" "$nag_file" 2>/dev/null || true
+                }
+                rm -f "${nag_file}.tmp"
+                log_info "Subscription nag patched. Refresh browser to apply."
+                changes_made=1
+            fi
+        else
+            log_info "Subscription nag already patched or not present."
+        fi
+    fi
+
+    # --- Run apt update ---
+    if (( changes_made )); then
+        echo
+        log_step "Running apt update..."
+        if apt-get update -qq 2>&1 | grep -i "err\|fail" | head -5 | sed 's/^/    /'; then
+            true  # grep returns 1 if no matches (no errors = good)
+        fi
+        log_info "Package lists updated."
+    fi
+
+    RESULTS[repos]="OK"
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  3. Syslog / Graylog Configuration                                      ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+validate_ip() {
+    local ip="$1"
+    # Accept IPv4 and IPv4:port or hostname
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$ ]]; then
+        return 0
+    fi
+    # Accept hostname
+    if [[ "$ip" =~ ^[a-zA-Z0-9._-]+(:[0-9]+)?$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+do_syslog_setup() {
+    log_header "3. Syslog → Graylog/Collector Configuration"
+
+    # Install rsyslog if missing
+    if ! command -v rsyslogd &>/dev/null; then
+        log_step "rsyslog not found, installing..."
+        apt-get update -qq
+        apt-get install -y -qq rsyslog
+        log_info "rsyslog installed."
+    else
+        log_info "rsyslog is installed."
+    fi
+
+    # Get target IP/host
+    local target="" port="514" protocol="udp"
+
+    if [[ -f "$RSYSLOG_CONF" ]]; then
+        log_warn "Existing config found: ${RSYSLOG_CONF}"
+        echo
+        cat "$RSYSLOG_CONF" | sed 's/^/    /'
+        echo
+        if ! confirm_action "Overwrite existing syslog config?"; then
+            log_info "Syslog config unchanged."
+            RESULTS[syslog]="SKIPPED (existing config kept)"
+            return 0
+        fi
+    fi
+
+    echo
+    read -rp "  Graylog/Syslog collector IP or hostname: " target
+
+    if [[ -z "$target" ]]; then
+        log_error "No target specified."
+        RESULTS[syslog]="FAILED - no target"
+        return 1
+    fi
+
+    # Parse port from IP:port format
+    if [[ "$target" == *:* ]]; then
+        port="${target##*:}"
+        target="${target%:*}"
+    else
+        read -rp "  Port [514]: " port
+        port="${port:-514}"
+    fi
+
+    if ! validate_ip "${target}:${port}" && ! validate_ip "$target"; then
+        log_error "Invalid target: ${target}"
+        RESULTS[syslog]="FAILED - invalid target"
+        return 1
+    fi
+
+    echo
+    echo -e "    ${CYAN}1)${NC} UDP (default, lightweight)"
+    echo -e "    ${CYAN}2)${NC} TCP (reliable delivery)"
+    echo
+    read -rp "  Protocol [1]: " proto_choice
+    proto_choice="${proto_choice:-1}"
+    [[ "$proto_choice" == "2" ]] && protocol="tcp"
+
+    # Build rsyslog config
+    local rsyslog_action
+    if [[ "$protocol" == "tcp" ]]; then
+        rsyslog_action="@@${target}:${port}"
+    else
+        rsyslog_action="@${target}:${port}"
+    fi
+
+    echo
+    log_step "Target: ${target}:${port} (${protocol^^})"
+
+    if ! confirm_action "Write syslog config?"; then
+        log_warn "Syslog setup skipped."
+        RESULTS[syslog]="SKIPPED"
+        return 0
+    fi
+
+    # Backup existing if present
+    [[ -f "$RSYSLOG_CONF" ]] && cp "$RSYSLOG_CONF" "${RSYSLOG_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+
+    cat > "$RSYSLOG_CONF" <<RSYSLOG_EOF
+# ==============================================================================
+# Graylog/Syslog forwarder - generated by proxmox-setup.sh
+# Date: $(date '+%Y-%m-%d %H:%M:%S')
+# Target: ${target}:${port} (${protocol^^})
+# ==============================================================================
+
+# Forward all logs to Graylog collector
+*.*  ${rsyslog_action}
+
+# Optional: Use RSYSLOG_SyslogProtocol23Format for RFC 5424 (structured data)
+# Uncomment the lines below if your collector supports RFC 5424:
+# template(name="GraylogFormat" type="string"
+#     string="<%PRI%>%PROTOCOL-VERSION% %TIMESTAMP:::date-rfc3339% %HOSTNAME% %APP-NAME% %PROCID% %MSGID% %STRUCTURED-DATA% %msg%\n"
+# )
+# *.*  ${rsyslog_action};GraylogFormat
+RSYSLOG_EOF
+
+    log_info "Config written: ${RSYSLOG_CONF}"
+
+    # Restart rsyslog
+    log_step "Restarting rsyslog..."
+    systemctl restart rsyslog
+    systemctl enable rsyslog 2>/dev/null || true
+    log_info "rsyslog restarted and enabled."
+
+    # Quick test
+    log_step "Sending test message..."
+    logger -t "proxmox-setup" "Syslog forwarding configured to ${target}:${port} (${protocol^^})"
+    log_info "Test message sent. Check your Graylog for 'proxmox-setup' tag."
+
+    RESULTS[syslog]="OK → ${target}:${port} (${protocol^^})"
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  4. Tailscale Installation                                               ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+do_tailscale_install() {
+    log_header "4. Tailscale VPN Installation"
+
+    if command -v tailscale &>/dev/null; then
+        local ts_ver
+        ts_ver="$(tailscale version 2>/dev/null | head -1 || echo "unknown")"
+        log_info "Tailscale already installed (${ts_ver})."
+
+        local ts_status
+        ts_status="$(tailscale status --json 2>/dev/null | grep -oP '"BackendState":"\K[^"]+' || echo "unknown")"
+        log_info "Status: ${ts_status}"
+
+        if [[ "$ts_status" == "Running" ]]; then
+            log_info "Tailscale is connected."
+            RESULTS[tailscale]="OK (already running)"
+            return 0
+        fi
+
+        if ! confirm_action "Tailscale installed but not connected. Proceed to 'tailscale up'?"; then
+            RESULTS[tailscale]="SKIPPED (installed, not connected)"
+            return 0
+        fi
+    else
+        log_step "Installing Tailscale via official installer..."
+        echo
+
+        if ! curl -fsSL https://tailscale.com/install.sh | sh; then
+            log_error "Tailscale installation failed."
+            RESULTS[tailscale]="FAILED - install error"
+            return 1
+        fi
+
+        echo
+        log_info "Tailscale installed."
+    fi
+
+    # Enable and start
+    systemctl enable --now tailscaled 2>/dev/null || true
+    log_info "tailscaled service enabled."
+
+    echo
+    log_step "Starting Tailscale authentication..."
+    log_warn "A browser URL will appear - use it to authenticate this node."
+    echo
+
+    tailscale up
+
+    echo
+    local ts_ip
+    ts_ip="$(tailscale ip -4 2>/dev/null || echo "N/A")"
+    log_info "Tailscale IP: ${ts_ip}"
+
+    RESULTS[tailscale]="OK (${ts_ip})"
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  Restore & Status                                                        ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+do_restore() {
+    log_header "Restore Network Config from Backup"
+
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log_error "No backup directory: ${BACKUP_DIR}"
+        return 1
+    fi
+
+    local backups=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && backups+=("$f")
+    done < <(find "$BACKUP_DIR" -name 'interfaces.backup.*' -type f 2>/dev/null | sort -r)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        log_error "No backups found."
+        return 1
+    fi
+
+    echo -e "  ${BOLD}Available backups:${NC}\n"
+    local i=1
+    for b in "${backups[@]}"; do
+        local ts
+        ts="$(stat -c '%y' "$b" 2>/dev/null | cut -d. -f1)"
+        printf "    ${CYAN}%2d)${NC} %s  ${DIM}(%s)${NC}\n" "$i" "$(basename "$b")" "$ts"
+        ((i++))
+    done
+    echo
+
+    local choice
+    read -rp "  Select backup [1-${#backups[@]}] (q to cancel): " choice
+    [[ "$choice" == "q" || "$choice" == "Q" ]] && { log_info "Cancelled."; return 0; }
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 )) || (( choice > ${#backups[@]} )); then
+        log_error "Invalid selection."
+        return 1
+    fi
+
+    local selected="${backups[$((choice - 1))]}"
+    echo
+    echo -e "  ${DIM}--- diff (current ← backup) ---${NC}"
+    diff --color=auto "$INTERFACES_FILE" "$selected" 2>/dev/null | sed 's/^/  /' || echo "  (no differences)"
+    echo -e "  ${DIM}--- end ---${NC}"
+    echo
+
+    if ! confirm_action "Restore this backup? (current config will be backed up first)"; then
+        log_info "Cancelled."
+        return 0
+    fi
+
+    create_network_backup
+    cp -a "$selected" "$INTERFACES_FILE"
+    log_info "Restored: $(basename "$selected")"
+
+    if confirm_action "Apply now with 'ifreload -a'?"; then
+        ifreload -a 2>/dev/null && log_info "Applied." || log_warn "ifreload failed. Reboot may be needed."
+    else
+        log_info "Saved but not applied."
+    fi
+}
+
+do_status() {
+    log_header "System Configuration Status"
+
+    # Proxmox version
+    echo -e "  ${BOLD}Proxmox VE:${NC}"
+    echo -e "    $(pveversion 2>/dev/null || echo "Not detected")"
+    echo
+
+    # Network interfaces & VLAN
+    echo -e "  ${BOLD}Network Interfaces:${NC}\n"
+    printf "    ${DIM}%-12s %-8s %-12s %-10s %-12s${NC}\n" "Interface" "Status" "Speed" "Bridge" "VLAN-Aware"
+    printf "    ${DIM}%s${NC}\n" "$(printf '%.0s─' {1..60})"
+
+    while IFS= read -r iface; do
+        [[ -z "$iface" ]] && continue
+        local status bridge vlan_str
+        status="$(get_interface_status "$iface")"
+        bridge="$(get_bridge_for_interface "$iface")"
+
+        if [[ -n "$bridge" ]]; then
+            is_vlan_aware "$bridge" && vlan_str="${GREEN}yes${NC}" || vlan_str="${RED}no${NC}"
+        else
+            bridge="-"; vlan_str="${DIM}-${NC}"
+        fi
+
+        [[ "$status" == "up" ]] && status="${GREEN}up${NC}" || status="${RED}${status}${NC}"
+
+        printf "    %-12s %-18b %-12s %-10s %-12b\n" \
+            "$iface" "$status" "$(get_interface_speed "$iface")" "$bridge" "$vlan_str"
+    done < <(get_physical_interfaces)
+    echo
+
+    # Repos
+    echo -e "  ${BOLD}Repositories:${NC}"
+    if [[ -f "$PVE_ENTERPRISE_LIST" ]] && grep -q "^deb " "$PVE_ENTERPRISE_LIST" 2>/dev/null; then
+        echo -e "    PVE Enterprise:    ${RED}ACTIVE${NC}"
+    else
+        echo -e "    PVE Enterprise:    ${GREEN}disabled${NC}"
+    fi
+    if [[ -f "$PVE_NO_SUB_LIST" ]] && grep -q "^deb " "$PVE_NO_SUB_LIST" 2>/dev/null; then
+        echo -e "    PVE No-Sub:        ${GREEN}ACTIVE${NC}"
+    else
+        echo -e "    PVE No-Sub:        ${RED}not configured${NC}"
+    fi
+    if [[ -f "$CEPH_ENTERPRISE_LIST" ]] && grep -q "^deb " "$CEPH_ENTERPRISE_LIST" 2>/dev/null; then
+        echo -e "    Ceph Enterprise:   ${RED}ACTIVE${NC}"
+    else
+        echo -e "    Ceph Enterprise:   ${GREEN}disabled${NC}"
+    fi
+    if [[ -f "$CEPH_NO_SUB_LIST" ]] && grep -q "^deb " "$CEPH_NO_SUB_LIST" 2>/dev/null; then
+        echo -e "    Ceph No-Sub:       ${GREEN}ACTIVE${NC}"
+    else
+        echo -e "    Ceph No-Sub:       ${RED}not configured${NC}"
+    fi
+    echo
+
+    # Syslog
+    echo -e "  ${BOLD}Syslog Forwarding:${NC}"
+    if [[ -f "$RSYSLOG_CONF" ]]; then
+        local target_line
+        target_line="$(grep -E '^\*\.\*' "$RSYSLOG_CONF" 2>/dev/null | head -1 || echo "none")"
+        echo -e "    Config:  ${GREEN}${RSYSLOG_CONF}${NC}"
+        echo -e "    Target:  ${target_line}"
+    else
+        echo -e "    ${DIM}Not configured${NC}"
+    fi
+    echo
+
+    # Tailscale
+    echo -e "  ${BOLD}Tailscale:${NC}"
+    if command -v tailscale &>/dev/null; then
+        local ts_ver ts_status ts_ip
+        ts_ver="$(tailscale version 2>/dev/null | head -1 || echo "?")"
+        ts_status="$(tailscale status --json 2>/dev/null | grep -oP '"BackendState":"\K[^"]+' || echo "unknown")"
+        ts_ip="$(tailscale ip -4 2>/dev/null || echo "N/A")"
+        echo -e "    Version: ${ts_ver}"
+        echo -e "    Status:  ${ts_status}"
+        echo -e "    IP:      ${ts_ip}"
+    else
+        echo -e "    ${DIM}Not installed${NC}"
+    fi
+    echo
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  Summary & Menu                                                          ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+print_summary() {
+    if [[ ${#RESULTS[@]} -eq 0 ]]; then return; fi
+
+    log_header "Summary"
+    for key in vlan repos syslog tailscale; do
+        if [[ -n "${RESULTS[$key]:-}" ]]; then
+            local label status_icon
+            case "$key" in
+                vlan)      label="VLAN Trunk" ;;
+                repos)     label="Repositories" ;;
+                syslog)    label="Syslog" ;;
+                tailscale) label="Tailscale" ;;
+            esac
+
+            if [[ "${RESULTS[$key]}" == OK* ]]; then
+                status_icon="${GREEN}✓${NC}"
+            elif [[ "${RESULTS[$key]}" == SKIP* ]]; then
+                status_icon="${YELLOW}–${NC}"
+            else
+                status_icon="${RED}✗${NC}"
+            fi
+
+            printf "  %b %-16s %s\n" "$status_icon" "${label}:" "${RESULTS[$key]}"
+        fi
+    done
+    echo
+}
+
+show_banner() {
+    echo -e "
+${CYAN}${BOLD}╔══════════════════════════════════════════════════════╗
+║         Proxmox VE Post-Install Setup ${SCRIPT_VERSION}            ║
+╚══════════════════════════════════════════════════════╝${NC}
+"
+}
+
+show_menu() {
+    echo -e "  ${BOLD}Configuration Options:${NC}
+"
+    echo -e "    ${CYAN}1)${NC} VLAN Trunk         Enable VLAN awareness on bridge"
+    echo -e "    ${CYAN}2)${NC} Repositories       Disable enterprise, enable no-subscription"
+    echo -e "    ${CYAN}3)${NC} Syslog             Configure rsyslog → Graylog/collector"
+    echo -e "    ${CYAN}4)${NC} Tailscale          Install Tailscale VPN"
+    echo -e ""
+    echo -e "    ${CYAN}5)${NC} ${BOLD}Run All${NC}            Execute 1-4 sequentially"
+    echo -e ""
+    echo -e "    ${CYAN}R)${NC} Restore            Restore network config from backup"
+    echo -e "    ${CYAN}S)${NC} Status             Show current configuration"
+    echo -e "    ${CYAN}Q)${NC} Quit"
+    echo
+}
+
+show_help() {
+    cat <<EOF
+
+${BOLD}${SCRIPT_NAME}${NC} ${SCRIPT_VERSION} - Proxmox VE Post-Install Configuration Tool
+
+${BOLD}Usage:${NC}
+  ${SCRIPT_NAME}            Interactive menu (default)
+  ${SCRIPT_NAME} --help     Show this help
+
+${BOLD}Menu Options:${NC}
+  1) VLAN Trunk      - Detect interfaces, select trunk, add bridge-vlan-aware
+  2) Repositories    - Disable enterprise repos, enable no-subscription, apt update
+  3) Syslog          - Install rsyslog if needed, configure forwarding to Graylog
+  4) Tailscale       - Install via official script, authenticate
+  5) Run All         - Execute 1-4 in sequence
+  R) Restore         - Restore /etc/network/interfaces from timestamped backup
+  S) Status          - Overview of current system configuration
+
+${BOLD}Requirements:${NC}
+  - Proxmox VE 8.3.0+
+  - Root privileges
+  - Internet access (for apt, Tailscale install)
+
+${BOLD}Backups:${NC}
+  Network config:  ${BACKUP_DIR}/
+  Repo files:      *.bak.<timestamp> alongside originals
+  Rsyslog config:  ${RSYSLOG_CONF}.bak.<timestamp>
+
+EOF
+}
+
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  Entry Point                                                             ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+main() {
+    case "${1:-}" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+    esac
+
+    check_root
+    show_banner
+    check_proxmox_version
+
+    while true; do
+        echo
+        show_menu
+        local choice
+        read -rp "  Select option: " choice
+
+        case "${choice,,}" in
+            1) do_vlan_setup; press_enter ;;
+            2) do_repo_setup; press_enter ;;
+            3) do_syslog_setup; press_enter ;;
+            4) do_tailscale_install; press_enter ;;
+            5)
+                log_header "Running All Configurations"
+                do_vlan_setup
+                do_repo_setup
+                do_syslog_setup
+                do_tailscale_install
+                print_summary
+                press_enter
+                ;;
+            r) do_restore; press_enter ;;
+            s) do_status; press_enter ;;
+            q) print_summary; log_info "Done."; exit 0 ;;
+            *) log_warn "Invalid option: ${choice}" ;;
+        esac
+    done
+}
+
+main "$@"
+
+# v2
