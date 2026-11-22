@@ -201,4 +201,4 @@ Full per-version history is kept in each script header.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
